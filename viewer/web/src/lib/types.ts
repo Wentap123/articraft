@@ -341,7 +341,7 @@ export type CostFilter = {
 };
 export type RatingFilterValue = "1" | "2" | "3" | "4" | "5" | "unrated";
 export type RatingFilter = RatingFilterValue[];
-export type InspectorTab = "inspect" | "diagnostics" | "render" | "code" | "metadata";
+export type InspectorTab = "inspect" | "render" | "code" | "metadata";
 
 export type ViewerState = {
   bootstrap: ViewerBootstrap | null;
