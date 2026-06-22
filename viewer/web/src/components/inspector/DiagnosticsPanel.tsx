@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState, type JSX } from "react";
+import * as THREE from "three";
 import { AlertTriangle, CheckCircle2, RefreshCw, ShieldAlert } from "lucide-react";
 
 import { fetchRecordFile, fetchStagingFile } from "@/lib/api";
@@ -9,6 +10,7 @@ import { Button } from "@/components/ui/button";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import {
   describeLinkVisuals,
+  originToMatrix4,
   parseUrdf,
   type UrdfJoint,
   type UrdfSpec,
@@ -17,6 +19,8 @@ import {
 type Severity = "ok" | "warning" | "critical";
 type Category = "joint" | "axis" | "range" | "collision" | "semantic" | "hierarchy";
 type SaveMode = "overwrite" | "new_version";
+type Vec3 = [number, number, number];
+type PreservedVisualOrigin = { xyz: Vec3; rpy: Vec3 };
 
 type CollisionSupport = {
   available: boolean;
@@ -37,7 +41,10 @@ type Candidate = {
   evidence: string;
 };
 
-type Patch = Candidate & { capturedPose: number | null };
+type Patch = Candidate & {
+  capturedPose: number | null;
+  preservedOrigin: PreservedVisualOrigin | null;
+};
 
 type Issue = {
   id: string;
@@ -129,6 +136,95 @@ function poseLabel(joint: UrdfJoint | undefined, value: number | null | undefine
     return `${(value * 180 / Math.PI).toFixed(1)} deg`;
   }
   return `${value.toFixed(3)} m`;
+}
+
+function cleanNumber(value: number): number {
+  return Math.abs(value) < 1e-10 ? 0 : Number(value.toPrecision(12));
+}
+
+function matrixToOrigin(matrix: THREE.Matrix4): PreservedVisualOrigin {
+  const position = new THREE.Vector3();
+  const quaternion = new THREE.Quaternion();
+  const scale = new THREE.Vector3();
+  matrix.decompose(position, quaternion, scale);
+  const euler = new THREE.Euler().setFromQuaternion(quaternion, "XYZ");
+  return {
+    xyz: [cleanNumber(position.x), cleanNumber(position.y), cleanNumber(position.z)],
+    rpy: [cleanNumber(euler.x), cleanNumber(euler.y), cleanNumber(euler.z)],
+  };
+}
+
+function jointMotionMatrix(joint: UrdfJoint, value: number | undefined): THREE.Matrix4 {
+  const amount = value ?? 0;
+  if (!isMovable(joint) || Math.abs(amount) < 1e-12) return new THREE.Matrix4();
+  const axisTuple = joint.axis ?? [1, 0, 0];
+  const axis = new THREE.Vector3(axisTuple[0], axisTuple[1], axisTuple[2]);
+  if (axis.lengthSq() < 1e-12) return new THREE.Matrix4();
+  axis.normalize();
+  if (joint.type === "prismatic") {
+    return new THREE.Matrix4().makeTranslation(axis.x * amount, axis.y * amount, axis.z * amount);
+  }
+  return new THREE.Matrix4().makeRotationAxis(axis, amount);
+}
+
+function rootLinks(spec: UrdfSpec): Set<string> {
+  const children = new Set(spec.joints.map((joint) => joint.child));
+  return new Set(
+    spec.links
+      .map((link) => link.name)
+      .filter((name) => !children.has(name) || /base|root|world|ground/i.test(name)),
+  );
+}
+
+function linkWorldTransforms(spec: UrdfSpec, jointValues: Map<string, number>): Map<string, THREE.Matrix4> {
+  const transforms = new Map<string, THREE.Matrix4>();
+  for (const root of rootLinks(spec)) transforms.set(root, new THREE.Matrix4());
+
+  let pending = [...spec.joints];
+  let madeProgress = true;
+  while (pending.length > 0 && madeProgress) {
+    madeProgress = false;
+    const next: UrdfJoint[] = [];
+    for (const joint of pending) {
+      const parentTransform = transforms.get(joint.parent);
+      if (!parentTransform) {
+        next.push(joint);
+        continue;
+      }
+      const originTransform = originToMatrix4(joint.origin);
+      const motionTransform = jointMotionMatrix(joint, jointValues.get(joint.name));
+      const parentToChild = new THREE.Matrix4().multiplyMatrices(originTransform, motionTransform);
+      const childTransform = new THREE.Matrix4().multiplyMatrices(parentTransform, parentToChild);
+      transforms.set(joint.child, childTransform);
+      madeProgress = true;
+    }
+    pending = next;
+  }
+
+  return transforms;
+}
+
+function preservedOriginForReparent(
+  spec: UrdfSpec,
+  candidate: Candidate,
+  jointValues: Map<string, number>,
+  capturedPose: number | null,
+): PreservedVisualOrigin | null {
+  const valuesAtCapture = new Map(jointValues);
+  if (capturedPose != null) valuesAtCapture.set(candidate.jointName, capturedPose);
+
+  const sourceLink = spec.links.find((link) => link.name === candidate.sourceLink);
+  const visual = sourceLink?.visuals[candidate.visualIndex];
+  if (!visual) return null;
+
+  const transforms = linkWorldTransforms(spec, valuesAtCapture);
+  const sourceWorld = transforms.get(candidate.sourceLink);
+  const targetWorld = transforms.get(candidate.targetLink);
+  if (!sourceWorld || !targetWorld) return null;
+
+  const visualWorld = new THREE.Matrix4().multiplyMatrices(sourceWorld, originToMatrix4(visual.origin));
+  const visualInTarget = new THREE.Matrix4().multiplyMatrices(targetWorld.clone().invert(), visualWorld);
+  return matrixToOrigin(visualInTarget);
 }
 
 function inspectJoint(joint: UrdfJoint, issues: Issue[]): void {
@@ -271,15 +367,6 @@ function inspectJoint(joint: UrdfJoint, issues: Issue[]): void {
   }
 }
 
-function rootLinks(spec: UrdfSpec): Set<string> {
-  const children = new Set(spec.joints.map((joint) => joint.child));
-  return new Set(
-    spec.links
-      .map((link) => link.name)
-      .filter((name) => !children.has(name) || /base|root|world|ground/i.test(name)),
-  );
-}
-
 function visualCandidates(spec: UrdfSpec, jointValues: Map<string, number>, collisionSupport: CollisionSupport): Candidate[] {
   const roots = rootLinks(spec);
   const movableByParent = new Map<string, UrdfJoint[]>();
@@ -371,7 +458,7 @@ function buildIssues(spec: UrdfSpec, jointValues: Map<string, number>, collision
       title: "Visual may be assigned to the wrong link",
       target: `${candidate.sourceLink} / ${candidate.visualLabel}`,
       evidence: candidate.evidence,
-      action: `Move ${candidate.visualLabel} to ${candidate.targetLink}, then re-run diagnostics.`,
+      action: `Move ${candidate.visualLabel} to ${candidate.targetLink}, preserving its observed pose, then re-run diagnostics.`,
       relatedJoint: candidate.jointName,
       candidate,
     });
@@ -394,7 +481,7 @@ function applyPatches(spec: UrdfSpec, patches: Patch[]): UrdfSpec {
     const visual = source?.visuals[patch.visualIndex];
     if (!source || !target || !visual) continue;
     source.visuals.splice(patch.visualIndex, 1);
-    target.visuals.push(visual);
+    target.visuals.push(patch.preservedOrigin ? { ...visual, origin: patch.preservedOrigin } : visual);
   }
 
   return { ...spec, links };
@@ -464,6 +551,18 @@ export function DiagnosticsPanel({ urdfSpec, jointValues, onJointChange, collisi
   const joints = patchedSpec?.joints ?? [];
   const movable = joints.filter(isMovable);
 
+  const queueCandidate = (candidate: Candidate): void => {
+    const capturedPose = jointValues.get(candidate.jointName) ?? null;
+    const preservedOrigin = patchedSpec
+      ? preservedOriginForReparent(patchedSpec, candidate, jointValues, capturedPose)
+      : null;
+    setPatches((current) =>
+      current.some((patch) => patch.id === candidate.id)
+        ? current
+        : [...current, { ...candidate, capturedPose, preservedOrigin }],
+    );
+  };
+
   const save = async (mode: SaveMode): Promise<void> => {
     if (selection?.kind !== "record" || patches.length === 0 || !patchedSpec) return;
     setStatus("Saving...");
@@ -477,6 +576,8 @@ export function DiagnosticsPanel({ urdfSpec, jointValues, onJointChange, collisi
           target_link: patch.targetLink,
           visual_index: patch.visualIndex,
           visual_name: patch.visualName,
+          origin_xyz: patch.preservedOrigin?.xyz,
+          origin_rpy: patch.preservedOrigin?.rpy,
           reason: patch.evidence,
         })),
       }),
@@ -489,7 +590,7 @@ export function DiagnosticsPanel({ urdfSpec, jointValues, onJointChange, collisi
     if (mode === "overwrite") {
       setCommittedSpec(patchedSpec);
       setPatches([]);
-      setStatus(`Applied ${payload.applied_count} move(s) to active URDF. Refresh the viewer to render the rewritten file.`);
+      setStatus(`Applied ${payload.applied_count} pose-preserving move(s) to active URDF. Refresh the viewer to render the rewritten file.`);
     } else {
       setStatus(`Saved diagnostic version: ${payload.version_file_path}`);
     }
@@ -563,17 +664,7 @@ export function DiagnosticsPanel({ urdfSpec, jointValues, onJointChange, collisi
           ) : (
             <div className="space-y-2">
               {issues.slice(0, 6).map((issue) => (
-                <IssueCard
-                  key={issue.id}
-                  issue={issue}
-                  onApply={(candidate) =>
-                    setPatches((current) =>
-                      current.some((patch) => patch.id === candidate.id)
-                        ? current
-                        : [...current, { ...candidate, capturedPose: jointValues.get(candidate.jointName) ?? null }],
-                    )
-                  }
-                />
+                <IssueCard key={issue.id} issue={issue} onApply={queueCandidate} />
               ))}
             </div>
           )}
@@ -618,7 +709,7 @@ export function DiagnosticsPanel({ urdfSpec, jointValues, onJointChange, collisi
           <SectionLabel>Repair queue</SectionLabel>
           {patches.length === 0 ? (
             <div className="rounded-lg border border-dashed border-[var(--border-subtle)] bg-[var(--surface-1)] px-3 py-3 text-[11px] leading-[1.5] text-[var(--text-tertiary)]">
-              Move a joint to a revealing pose, apply a suggested visual move, then diagnostics re-run against the patched URDF.
+              Move a joint to a revealing pose, apply a suggested visual move, then diagnostics re-run against a pose-preserving patched URDF.
             </div>
           ) : (
             <div className="space-y-2">
@@ -630,7 +721,7 @@ export function DiagnosticsPanel({ urdfSpec, jointValues, onJointChange, collisi
                         {patch.visualLabel}: {patch.sourceLink}{" -> "}{patch.targetLink}
                       </p>
                       <p className="mt-1 text-[10.5px] text-[var(--text-tertiary)]">
-                        Captured {patch.jointName}: {poseLabel(joints.find((joint) => joint.name === patch.jointName), patch.capturedPose)}
+                        Captured {patch.jointName}: {poseLabel(joints.find((joint) => joint.name === patch.jointName), patch.capturedPose)} · {patch.preservedOrigin ? "pose preserved" : "origin fallback"}
                       </p>
                     </div>
                     <Button
