@@ -11,6 +11,7 @@ from viewer.api.file_resolver import ViewerFileResolver
 from viewer.api.frontend import install_frontend_routes
 from viewer.api.routes import (
     collections_router,
+    diagnostics_router,
     files_router,
     records_router,
     runs_router,
@@ -59,6 +60,7 @@ def create_app(*, repo_root: Path | None = None) -> FastAPI:
     app.include_router(records_router)
     app.include_router(runs_router)
     app.include_router(files_router)
+    app.include_router(diagnostics_router)
     install_frontend_routes(app)
     return app
 
