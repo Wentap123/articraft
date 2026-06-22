@@ -85,6 +85,19 @@ def copy_tree(source_dir: Path, record_dir: Path, overwrite: bool) -> None:
             shutil.copy2(child, target)
 
 
+def write_workbench_entry(repo: StorageRepo, record_id: str, *, added_at: str, label: str) -> None:
+    write_json(
+        repo.layout.record_workbench_entry_path(record_id),
+        {
+            "record_id": record_id,
+            "added_at": added_at,
+            "label": label,
+            "tags": ["imported", "mobility", "urdf"],
+            "archived": False,
+        },
+    )
+
+
 def write_record_metadata(repo: StorageRepo, record_id: str, source_dir: Path, title: str, prompt: str, urdf_text: str) -> None:
     now = utc_now()
     record_dir = repo.layout.record_dir(record_id)
@@ -171,11 +184,12 @@ def write_record_metadata(repo: StorageRepo, record_id: str, source_dir: Path, t
         "display": {"title": title or record_id, "prompt_preview": prompt_text},
         "artifacts": artifacts,
         "hashes": hashes,
-        "collections": [],
+        "collections": ["workbench"],
         "active_revision_id": REVISION_ID,
         "lineage": {"origin_record_id": None, "parent_record_id": None},
         "creator": {"mode": "external_agent", "agent": "codex", "trace_available": False},
     })
+    write_workbench_entry(repo, record_id, added_at=now, label=title or record_id)
     materialization_dir = repo.layout.record_materialization_dir(record_id)
     materialization_dir.mkdir(parents=True, exist_ok=True)
     write_text(repo.layout.record_materialization_urdf_path(record_id), urdf_text)
