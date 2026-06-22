@@ -6,6 +6,7 @@ import type { InspectorTab } from "@/lib/types";
 import { useViewer, useViewerDispatch } from "@/lib/viewer-context";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import { DiagnosticsPanel } from "@/components/inspector/DiagnosticsPanel";
 import { InspectPanel } from "@/components/inspector/InspectPanel";
 import { RenderOptionsPanel } from "@/components/inspector/RenderOptionsPanel";
 import { defaultRenderOptions, type RenderOptions } from "@/components/viewer3d/useRenderOptions";
@@ -71,6 +72,7 @@ export function InspectorTabs({
 
   const tabLabels = {
     inspect: "Inspect",
+    diagnostics: "Diagnostics",
     render: "Render",
     code: "Code",
     metadata: "Metadata",
@@ -90,7 +92,7 @@ export function InspectorTabs({
             <TabsTrigger
               key={tab}
               value={tab}
-              className="relative rounded-none px-3 py-2.5 text-[11px] font-medium text-[var(--text-tertiary)] transition-colors duration-150 hover:text-[var(--text-secondary)] data-[state=active]:text-[var(--text-primary)] data-[state=active]:bg-transparent data-[state=active]:shadow-none data-[state=active]:after:absolute data-[state=active]:after:bottom-0 data-[state=active]:after:left-3 data-[state=active]:after:right-3 data-[state=active]:after:h-[1.5px] data-[state=active]:after:rounded-full data-[state=active]:after:bg-[var(--text-primary)]"
+              className="relative rounded-none px-2.5 py-2.5 text-[11px] font-medium text-[var(--text-tertiary)] transition-colors duration-150 hover:text-[var(--text-secondary)] data-[state=active]:text-[var(--text-primary)] data-[state=active]:bg-transparent data-[state=active]:shadow-none data-[state=active]:after:absolute data-[state=active]:after:bottom-0 data-[state=active]:after:left-2.5 data-[state=active]:after:right-2.5 data-[state=active]:after:h-[1.5px] data-[state=active]:after:rounded-full data-[state=active]:after:bg-[var(--text-primary)]"
             >{tabLabels[tab]}</TabsTrigger>
           ))}
         </TabsList>
@@ -116,6 +118,15 @@ export function InspectorTabs({
           jointValues={jointValues}
           onJointChange={onJointChange}
           onResetAll={onResetAll}
+        />
+      </TabsContent>
+
+      <TabsContent value="diagnostics" className="min-h-0 flex-1 overflow-hidden px-3 pb-3 pt-3">
+        <DiagnosticsPanel
+          urdfSpec={urdfSpec}
+          jointValues={jointValues}
+          onJointChange={onJointChange}
+          collisionSupport={collisionSupport}
         />
       </TabsContent>
 
