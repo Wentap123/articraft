@@ -13,7 +13,9 @@ import {
   originToMatrix4,
   parseUrdf,
   type UrdfJoint,
+  type UrdfLink,
   type UrdfSpec,
+  type UrdfVisual,
 } from "@/components/viewer3d/urdf-parser";
 
 type Severity = "ok" | "warning" | "critical";
@@ -28,6 +30,14 @@ type CollisionSupport = {
   detail: string;
   compileCommand: string | null;
 } | null;
+
+type CollisionHit = {
+  joint: UrdfJoint;
+  linkName: string;
+  proxyLabel: string;
+  distance: number;
+  threshold: number;
+};
 
 type Candidate = {
   id: string;
@@ -74,8 +84,9 @@ const CATEGORY_LABELS: Record<Category, string> = {
   hierarchy: "Hierarchy",
 };
 
-const SUSPICIOUS_VISUAL_RE =
-  /outlier|fragment|island|loose|detached|floating|original[-_ ]?\d+|segment[-_ ]?\d+/i;
+const OUTLIER_VISUAL_RE = /outlier/i;
+const PROXY_FALLBACK_RADIUS = 0.035;
+const PROXY_CONTACT_MARGIN = 0.006;
 
 function SeverityBadge({ severity, label }: { severity: Severity; label?: string }): JSX.Element {
   const variant = severity === "critical" ? "destructive" : severity === "warning" ? "warning" : "success";
@@ -202,6 +213,85 @@ function linkWorldTransforms(spec: UrdfSpec, jointValues: Map<string, number>): 
   }
 
   return transforms;
+}
+
+function descendantsForLink(spec: UrdfSpec, rootLinkName: string): Set<string> {
+  const descendants = new Set<string>([rootLinkName]);
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const joint of spec.joints) {
+      if (descendants.has(joint.parent) && !descendants.has(joint.child)) {
+        descendants.add(joint.child);
+        changed = true;
+      }
+    }
+  }
+  return descendants;
+}
+
+function proxyRadius(geometry: UrdfVisual["geometry"]): number {
+  if (geometry.type === "sphere") return Math.max(geometry.radius ?? PROXY_FALLBACK_RADIUS, PROXY_FALLBACK_RADIUS);
+  if (geometry.type === "cylinder") {
+    const radius = geometry.radius ?? PROXY_FALLBACK_RADIUS;
+    const halfLength = (geometry.length ?? PROXY_FALLBACK_RADIUS * 2) / 2;
+    return Math.max(Math.hypot(radius, halfLength), PROXY_FALLBACK_RADIUS);
+  }
+  if (geometry.type === "box") {
+    const size = geometry.size ?? [PROXY_FALLBACK_RADIUS * 2, PROXY_FALLBACK_RADIUS * 2, PROXY_FALLBACK_RADIUS * 2];
+    return Math.max(Math.hypot(size[0] / 2, size[1] / 2, size[2] / 2), PROXY_FALLBACK_RADIUS);
+  }
+  const scale = geometry.scale ?? [1, 1, 1];
+  return Math.max(Math.max(Math.abs(scale[0]), Math.abs(scale[1]), Math.abs(scale[2])) * PROXY_FALLBACK_RADIUS, PROXY_FALLBACK_RADIUS);
+}
+
+function itemWorldPosition(linkName: string, item: UrdfVisual, transforms: Map<string, THREE.Matrix4>): THREE.Vector3 | null {
+  const linkWorld = transforms.get(linkName);
+  if (!linkWorld) return null;
+  const itemWorld = new THREE.Matrix4().multiplyMatrices(linkWorld, originToMatrix4(item.origin));
+  return new THREE.Vector3().setFromMatrixPosition(itemWorld);
+}
+
+function linkByName(spec: UrdfSpec): Map<string, UrdfLink> {
+  return new Map(spec.links.map((link) => [link.name, link]));
+}
+
+function collisionHitForVisual(
+  spec: UrdfSpec,
+  sourceLink: UrdfLink,
+  visual: UrdfVisual,
+  childJoints: UrdfJoint[],
+  transforms: Map<string, THREE.Matrix4>,
+): CollisionHit | null {
+  const visualPosition = itemWorldPosition(sourceLink.name, visual, transforms);
+  if (!visualPosition) return null;
+  const visualRadius = proxyRadius(visual.geometry);
+  const links = linkByName(spec);
+  let best: CollisionHit | null = null;
+  let bestOverlap = -Infinity;
+
+  for (const joint of childJoints) {
+    const descendants = descendantsForLink(spec, joint.child);
+    for (const linkName of descendants) {
+      if (linkName === sourceLink.name) continue;
+      const link = links.get(linkName);
+      if (!link || link.collisions.length === 0) continue;
+      for (const descriptor of describeLinkVisuals({ ...link, visuals: link.collisions })) {
+        const collision = link.collisions[descriptor.index];
+        const collisionPosition = itemWorldPosition(linkName, collision, transforms);
+        if (!collisionPosition) continue;
+        const threshold = visualRadius + proxyRadius(collision.geometry) + PROXY_CONTACT_MARGIN;
+        const distance = visualPosition.distanceTo(collisionPosition);
+        const overlap = threshold - distance;
+        if (overlap >= 0 && overlap > bestOverlap) {
+          bestOverlap = overlap;
+          best = { joint, linkName, proxyLabel: descriptor.label, distance, threshold };
+        }
+      }
+    }
+  }
+
+  return best;
 }
 
 function preservedOriginForReparent(
@@ -368,7 +458,6 @@ function inspectJoint(joint: UrdfJoint, issues: Issue[]): void {
 }
 
 function visualCandidates(spec: UrdfSpec, jointValues: Map<string, number>, collisionSupport: CollisionSupport): Candidate[] {
-  const roots = rootLinks(spec);
   const movableByParent = new Map<string, UrdfJoint[]>();
   for (const joint of spec.joints.filter(isMovable)) {
     const list = movableByParent.get(joint.parent) ?? [];
@@ -376,6 +465,7 @@ function visualCandidates(spec: UrdfSpec, jointValues: Map<string, number>, coll
     movableByParent.set(joint.parent, list);
   }
 
+  const transforms = linkWorldTransforms(spec, jointValues);
   const candidates: Candidate[] = [];
   for (const link of spec.links) {
     const childJoints = movableByParent.get(link.name) ?? [];
@@ -383,26 +473,31 @@ function visualCandidates(spec: UrdfSpec, jointValues: Map<string, number>, coll
 
     for (const descriptor of describeLinkVisuals(link)) {
       const visual = link.visuals[descriptor.index];
-      const meshFilename = visual?.geometry.type === "mesh" ? visual.geometry.filename ?? null : null;
-      const text = [descriptor.label, visual?.name, meshFilename].filter(Boolean).join(" ");
+      if (!visual) continue;
+      const meshFilename = visual.geometry.type === "mesh" ? visual.geometry.filename ?? null : null;
+      const text = [descriptor.label, visual.name, meshFilename].filter(Boolean).join(" ");
       const lowerText = text.toLowerCase();
-      const targetJoint =
-        childJoints.find(
-          (joint) => lowerText.includes(joint.child.toLowerCase()) || lowerText.includes(joint.name.toLowerCase()),
-        ) ?? childJoints[0];
+      const collisionHit = collisionHitForVisual(spec, link, visual, childJoints, transforms);
+      const namedJoint = childJoints.find(
+        (joint) => lowerText.includes(joint.child.toLowerCase()) || lowerText.includes(joint.name.toLowerCase()),
+      );
+      const targetJoint = collisionHit?.joint ?? namedJoint ?? childJoints[0];
       const movedPose = Math.abs(jointValues.get(targetJoint.name) ?? 0) > 0.001;
-      const suspiciousName = SUSPICIOUS_VISUAL_RE.test(text);
-      const likelyStaticBucket = roots.has(link.name) && childJoints.length === 1;
-      if (!suspiciousName && !(likelyStaticBucket && movedPose)) continue;
+      const outlierName = OUTLIER_VISUAL_RE.test(text);
+
+      if (!outlierName && !collisionHit) continue;
 
       const evidence = [
         `Visual ${descriptor.label} is attached to ${link.name}.`,
+        outlierName ? "Name contains outlier." : null,
+        collisionHit
+          ? `Collision proxy overlaps ${collisionHit.linkName} / ${collisionHit.proxyLabel}; estimated distance ${collisionHit.distance.toFixed(4)} <= ${collisionHit.threshold.toFixed(4)}.`
+          : null,
         `Candidate movable child is ${targetJoint.child} through ${targetJoint.name}.`,
-        suspiciousName ? "Name or mesh looks like an outlier fragment." : null,
         movedPose
           ? `Current ${targetJoint.name} pose is ${poseLabel(targetJoint, jointValues.get(targetJoint.name))}.`
-          : "Move the joint away from neutral to confirm whether this fragment should follow it.",
-        collisionSupport?.available ? "Collision view is available as secondary evidence." : null,
+          : "Move the joint away from neutral to confirm whether this visual should follow it.",
+        collisionSupport?.available ? "Collision geometry is available for this asset." : null,
       ]
         .filter(Boolean)
         .join(" ");
@@ -414,7 +509,7 @@ function visualCandidates(spec: UrdfSpec, jointValues: Map<string, number>, coll
         jointName: targetJoint.name,
         visualIndex: descriptor.index,
         visualLabel: descriptor.label,
-        visualName: visual?.name ?? null,
+        visualName: visual.name ?? null,
         meshFilename,
         evidence,
       });
@@ -487,6 +582,10 @@ function applyPatches(spec: UrdfSpec, patches: Patch[]): UrdfSpec {
   return { ...spec, links };
 }
 
+function issueDismissKey(issue: Issue): string {
+  return issue.candidate ? `candidate:${issue.candidate.id}` : `${issue.category}:${issue.title}:${issue.target}`;
+}
+
 async function readError(response: Response): Promise<string> {
   try {
     const payload = (await response.json()) as { detail?: unknown; message?: unknown };
@@ -503,6 +602,7 @@ export function DiagnosticsPanel({ urdfSpec, jointValues, onJointChange, collisi
   const [fetchedSpec, setFetchedSpec] = useState<UrdfSpec | null>(null);
   const [committedSpec, setCommittedSpec] = useState<UrdfSpec | null>(null);
   const [patches, setPatches] = useState<Patch[]>([]);
+  const [dismissedIssues, setDismissedIssues] = useState<Set<string>>(() => new Set());
   const [status, setStatus] = useState<string | null>(null);
   const [reload, setReload] = useState(0);
   const stagingEntry = selection?.kind === "staging" ? findStagingEntryInBootstrap(bootstrap, selection.runId, selection.recordId) : null;
@@ -516,6 +616,7 @@ export function DiagnosticsPanel({ urdfSpec, jointValues, onJointChange, collisi
   useEffect(() => {
     setPatches([]);
     setCommittedSpec(null);
+    setDismissedIssues(new Set());
     setStatus(null);
   }, [selectionKey]);
 
@@ -540,9 +641,13 @@ export function DiagnosticsPanel({ urdfSpec, jointValues, onJointChange, collisi
 
   const baseSpec = committedSpec ?? fetchedSpec ?? (urdfSpec ? { name: "viewer", links: [], joints: urdfSpec.joints } : null);
   const patchedSpec = useMemo(() => (baseSpec ? applyPatches(baseSpec, patches) : null), [baseSpec, patches]);
-  const issues = useMemo(
+  const rawIssues = useMemo(
     () => (patchedSpec ? buildIssues(patchedSpec, jointValues, collisionSupport) : []),
     [collisionSupport, jointValues, patchedSpec],
+  );
+  const issues = useMemo(
+    () => rawIssues.filter((issue) => !dismissedIssues.has(issueDismissKey(issue))),
+    [dismissedIssues, rawIssues],
   );
   const critical = issues.filter((issue) => issue.severity === "critical").length;
   const warnings = issues.filter((issue) => issue.severity === "warning").length;
@@ -550,6 +655,19 @@ export function DiagnosticsPanel({ urdfSpec, jointValues, onJointChange, collisi
   const overall: Severity = critical > 0 || score >= 70 ? "critical" : warnings > 0 ? "warning" : "ok";
   const joints = patchedSpec?.joints ?? [];
   const movable = joints.filter(isMovable);
+
+  const rerunDiagnostics = (): void => {
+    setDismissedIssues(new Set());
+    setReload((value) => value + 1);
+  };
+
+  const dismissIssue = (issue: Issue): void => {
+    setDismissedIssues((current) => {
+      const next = new Set(current);
+      next.add(issueDismissKey(issue));
+      return next;
+    });
+  };
 
   const queueCandidate = (candidate: Candidate): void => {
     const capturedPose = jointValues.get(candidate.jointName) ?? null;
@@ -627,10 +745,11 @@ export function DiagnosticsPanel({ urdfSpec, jointValues, onJointChange, collisi
             <Metric label="warnings" value={warnings} />
           </div>
           <div className="mt-3 flex flex-wrap gap-2">
-            <Button type="button" variant="outline" size="sm" onClick={() => setReload((value) => value + 1)}>
+            <Button type="button" variant="outline" size="sm" onClick={rerunDiagnostics}>
               <RefreshCw className="mr-1 size-3" /> Re-run
             </Button>
             {patches.length ? <Badge>{patches.length} pending</Badge> : null}
+            {dismissedIssues.size ? <Badge>{dismissedIssues.size} ignored</Badge> : null}
           </div>
         </section>
 
@@ -664,7 +783,7 @@ export function DiagnosticsPanel({ urdfSpec, jointValues, onJointChange, collisi
           ) : (
             <div className="space-y-2">
               {issues.slice(0, 6).map((issue) => (
-                <IssueCard key={issue.id} issue={issue} onApply={queueCandidate} />
+                <IssueCard key={issue.id} issue={issue} onApply={queueCandidate} onDismiss={dismissIssue} />
               ))}
             </div>
           )}
@@ -764,7 +883,7 @@ function Metric({ label, value }: { label: string; value: number }): JSX.Element
   );
 }
 
-function IssueCard({ issue, onApply }: { issue: Issue; onApply: (candidate: Candidate) => void }): JSX.Element {
+function IssueCard({ issue, onApply, onDismiss }: { issue: Issue; onApply: (candidate: Candidate) => void; onDismiss: (issue: Issue) => void }): JSX.Element {
   return (
     <div className="rounded-lg border border-[var(--border-subtle)] bg-[var(--surface-1)] px-3 py-2.5">
       <div className="flex items-start justify-between gap-2">
@@ -772,7 +891,12 @@ function IssueCard({ issue, onApply }: { issue: Issue; onApply: (candidate: Cand
           <p className="truncate text-[11px] font-semibold text-[var(--text-primary)]">{issue.title}</p>
           <p className="mt-1 font-mono text-[10px] text-[var(--text-quaternary)]">{issue.target}</p>
         </div>
-        <SeverityBadge severity={issue.severity} />
+        <div className="flex shrink-0 items-center gap-1.5">
+          <Button type="button" size="sm" variant="ghost" className="h-6 px-1.5 text-[11px]" title="Ignore this error" onClick={() => onDismiss(issue)}>
+            ❌
+          </Button>
+          <SeverityBadge severity={issue.severity} />
+        </div>
       </div>
       <p className="mt-2 text-[10.5px] leading-[1.45] text-[var(--text-secondary)]"><span className="font-medium">Evidence:</span> {issue.evidence}</p>
       <p className="mt-1 text-[10.5px] leading-[1.45] text-[var(--text-tertiary)]"><span className="font-medium">Action:</span> {issue.action}</p>
