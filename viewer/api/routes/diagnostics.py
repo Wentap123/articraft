@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import shutil
 from datetime import datetime, timezone
 from pathlib import Path
@@ -14,12 +15,16 @@ from viewer.api.dependencies import FileResolverDep, ViewerStoreDep
 
 router = APIRouter()
 
+Vec3 = tuple[float, float, float]
+
 
 class VisualReassignmentMove(BaseModel):
     source_link: str = Field(min_length=1)
     target_link: str = Field(min_length=1)
     visual_index: int = Field(ge=0)
     visual_name: str | None = None
+    origin_xyz: Vec3 | None = None
+    origin_rpy: Vec3 | None = None
     reason: str | None = None
 
     @field_validator("source_link", "target_link", "visual_name", "reason")
@@ -29,6 +34,18 @@ class VisualReassignmentMove(BaseModel):
             return None
         stripped = value.strip()
         return stripped or None
+
+    @field_validator("origin_xyz", "origin_rpy", mode="before")
+    @classmethod
+    def _validate_vec3(cls, value: object) -> Vec3 | None:
+        if value is None:
+            return None
+        if not isinstance(value, (list, tuple)) or len(value) != 3:
+            raise ValueError("origin vectors must contain exactly 3 numbers")
+        parsed = tuple(float(item) for item in value)
+        if not all(math.isfinite(item) for item in parsed):
+            raise ValueError("origin vectors must contain finite numbers")
+        return parsed  # type: ignore[return-value]
 
 
 class VisualReassignmentRequest(BaseModel):
@@ -84,6 +101,24 @@ def _find_link(root: ET.Element, link_name: str) -> ET.Element | None:
     return None
 
 
+def _format_vec3(value: Vec3) -> str:
+    return " ".join(f"{item:.12g}" for item in value)
+
+
+def _set_visual_origin(visual: ET.Element, xyz: Vec3 | None, rpy: Vec3 | None) -> None:
+    if xyz is None and rpy is None:
+        return
+    origins = _direct_children(visual, "origin")
+    origin = origins[0] if origins else None
+    if origin is None:
+        origin = ET.Element("origin")
+        visual.insert(0, origin)
+    if xyz is not None:
+        origin.set("xyz", _format_vec3(xyz))
+    if rpy is not None:
+        origin.set("rpy", _format_vec3(rpy))
+
+
 def _apply_visual_reassignments(
     urdf_xml: str,
     moves: list[VisualReassignmentMove],
@@ -120,6 +155,7 @@ def _apply_visual_reassignments(
                 ),
             )
 
+        _set_visual_origin(visual, move.origin_xyz, move.origin_rpy)
         source.remove(visual)
         target.append(visual)
         applied.append(
@@ -128,6 +164,8 @@ def _apply_visual_reassignments(
                 "target_link": move.target_link,
                 "visual_index": move.visual_index,
                 "visual_name": actual_name,
+                "origin_xyz": list(move.origin_xyz) if move.origin_xyz is not None else None,
+                "origin_rpy": list(move.origin_rpy) if move.origin_rpy is not None else None,
                 "reason": move.reason,
             }
         )
@@ -161,7 +199,7 @@ async def apply_visual_reassignments(
     patch_path.write_text(
         json.dumps(
             {
-                "schema_version": 1,
+                "schema_version": 2,
                 "record_id": record_id,
                 "mode": payload.mode,
                 "created_at": datetime.now(timezone.utc).isoformat(),
