@@ -34,11 +34,13 @@ export interface RecordTextFileResult {
 
 export class HttpError extends Error {
   readonly status: number;
+  readonly statusText: string;
 
   constructor(status: number, message: string) {
     super(message);
     this.name = "HttpError";
     this.status = status;
+    this.statusText = message;
   }
 }
 
@@ -125,36 +127,48 @@ export async function fetchDashboard(
     searchParams.append("category", categoryFilter);
   }
   searchParams.set("rolling_window_days", String(params.rollingWindowDays));
-
   return fetchJson<DashboardData>(`/api/dashboard?${searchParams.toString()}`, init);
-}
-
-export async function fetchCategories(): Promise<CategoryOption[]> {
-  return fetchJson<CategoryOption[]>("/api/categories");
 }
 
 export async function fetchDatasetEntries(): Promise<DatasetEntry[]> {
   return fetchJson<DatasetEntry[]>("/api/collections/dataset");
 }
 
-export async function fetchRecordSummary(recordId: string): Promise<RecordSummary> {
-  return fetchJson<RecordSummary>(`/api/records/${encodeURIComponent(recordId)}/summary`);
+export async function fetchCategories(): Promise<CategoryOption[]> {
+  return fetchJson<CategoryOption[]>("/api/categories");
 }
 
-export async function fetchRecordHistory(recordId: string): Promise<RecordHistory> {
-  return fetchJson<RecordHistory>(`/api/records/${encodeURIComponent(recordId)}/history`);
+export async function fetchStagingEntries(): Promise<StagingEntry[]> {
+  return fetchJson<StagingEntry[]>("/api/staging");
 }
 
-export async function hydrateRecord(recordId: string): Promise<HydrateRecordResult> {
-  return fetchJson<HydrateRecordResult>(`/api/records/${encodeURIComponent(recordId)}/hydrate`, {
-    method: "POST",
-  });
+export async function fetchRecordSummary(recordId: string): Promise<RecordSummary | null> {
+  return fetchJson<RecordSummary | null>(`/api/records/${encodeURIComponent(recordId)}/summary`);
+}
+
+export async function fetchRecordDetail(recordId: string) {
+  return fetchJson(`/api/records/${encodeURIComponent(recordId)}`);
+}
+
+export async function fetchRecordFile(recordId: string, filePath: string): Promise<string> {
+  const result = await fetchJson<RecordTextFileResult>(
+    `/api/records/${encodeURIComponent(recordId)}/files/${encodeURIComponent(filePath)}`,
+  );
+  return result.content;
+}
+
+export async function fetchStagingFile(runId: string, recordId: string, filePath: string): Promise<string> {
+  const result = await fetchJson<RecordTextFileResult>(
+    `/api/staging/${encodeURIComponent(runId)}/${encodeURIComponent(recordId)}/files/${encodeURIComponent(filePath)}`,
+  );
+  return result.content;
 }
 
 export async function browseRecords(params: {
   source: SourceFilter;
   query: string;
-  runId: string | null;
+  limit: number;
+  offset: number;
   timeFilter: TimeFilter;
   modelFilter: string | null;
   sdkFilter: string | null;
@@ -164,56 +178,16 @@ export async function browseRecords(params: {
   costFilter: CostFilter;
   ratingFilter: RatingFilter;
   secondaryRatingFilter: RatingFilter;
-  offset?: number;
-  limit?: number;
 }): Promise<RecordBrowseResponse> {
   const searchParams = new URLSearchParams();
-  appendBrowseParams(searchParams, params);
-  if (params.offset != null) {
-    searchParams.set("offset", String(params.offset));
-  }
-  if (params.limit != null) {
-    searchParams.set("limit", String(params.limit));
-  }
-  return fetchJson<RecordBrowseResponse>(`/api/records/browse?${searchParams.toString()}`);
-}
-
-function appendBrowseParams(
-  searchParams: URLSearchParams,
-  params: {
-    source: SourceFilter;
-    query: string;
-    runId: string | null;
-    timeFilter: TimeFilter;
-    modelFilter: string | null;
-    sdkFilter: string | null;
-    agentHarnessFilters: string[];
-    authorFilters: string[];
-    categoryFilters: string[];
-    costFilter: CostFilter;
-    ratingFilter: RatingFilter;
-    secondaryRatingFilter: RatingFilter;
-  },
-): void {
   searchParams.set("source", params.source);
-  if (params.query.trim()) {
-    searchParams.set("q", params.query.trim());
-  }
-  if (params.runId) {
-    searchParams.set("run_id", params.runId);
-  }
-  if (params.timeFilter.oldest) {
-    searchParams.set("time_from", params.timeFilter.oldest);
-  }
-  if (params.timeFilter.newest) {
-    searchParams.set("time_to", params.timeFilter.newest);
-  }
-  if (params.modelFilter) {
-    searchParams.set("model", params.modelFilter);
-  }
-  if (params.sdkFilter) {
-    searchParams.set("sdk", params.sdkFilter);
-  }
+  searchParams.set("limit", String(params.limit));
+  searchParams.set("offset", String(params.offset));
+  if (params.query.trim()) searchParams.set("q", params.query.trim());
+  if (params.timeFilter.oldest) searchParams.set("time_from", params.timeFilter.oldest);
+  if (params.timeFilter.newest) searchParams.set("time_to", params.timeFilter.newest);
+  if (params.modelFilter) searchParams.set("model", params.modelFilter);
+  if (params.sdkFilter) searchParams.set("sdk", params.sdkFilter);
   for (const agentHarnessFilter of params.agentHarnessFilters) {
     searchParams.append("agent_harness", agentHarnessFilter);
   }
@@ -223,24 +197,20 @@ function appendBrowseParams(
   for (const categoryFilter of params.categoryFilters) {
     searchParams.append("category", categoryFilter);
   }
-  if (params.costFilter.min != null) {
-    searchParams.set("cost_min", String(params.costFilter.min));
+  if (params.costFilter.min != null) searchParams.set("cost_min", String(params.costFilter.min));
+  if (params.costFilter.max != null) searchParams.set("cost_max", String(params.costFilter.max));
+  for (const rating of params.ratingFilter) {
+    searchParams.append("rating", rating);
   }
-  if (params.costFilter.max != null) {
-    searchParams.set("cost_max", String(params.costFilter.max));
+  for (const rating of params.secondaryRatingFilter) {
+    searchParams.append("secondary_rating", rating);
   }
-  for (const ratingFilter of params.ratingFilter) {
-    searchParams.append("rating", ratingFilter);
-  }
-  for (const secondaryRatingFilter of params.secondaryRatingFilter) {
-    searchParams.append("secondary_rating", secondaryRatingFilter);
-  }
+  return fetchJson<RecordBrowseResponse>(`/api/records?${searchParams.toString()}`);
 }
 
 export async function fetchBrowseRecordIds(params: {
   source: SourceFilter;
   query: string;
-  runId: string | null;
   timeFilter: TimeFilter;
   modelFilter: string | null;
   sdkFilter: string | null;
@@ -252,43 +222,12 @@ export async function fetchBrowseRecordIds(params: {
   secondaryRatingFilter: RatingFilter;
 }): Promise<RecordBrowseIdsResponse> {
   const searchParams = new URLSearchParams();
-  appendBrowseParams(searchParams, params);
-  return fetchJson<RecordBrowseIdsResponse>(`/api/records/browse/ids?${searchParams.toString()}`);
-}
-
-export async function searchRecords(params: {
-  query: string;
-  source: "workbench" | "dataset";
-  runId: string | null;
-  timeFilter: TimeFilter;
-  modelFilter: string | null;
-  sdkFilter: string | null;
-  agentHarnessFilters: string[];
-  authorFilters: string[];
-  categoryFilters: string[];
-  costFilter: CostFilter;
-  ratingFilter: RatingFilter;
-  secondaryRatingFilter: RatingFilter;
-  limit?: number;
-}): Promise<RecordSummary[]> {
-  const searchParams = new URLSearchParams();
-  searchParams.set("q", params.query);
   searchParams.set("source", params.source);
-  if (params.runId) {
-    searchParams.set("run_id", params.runId);
-  }
-  if (params.timeFilter.oldest) {
-    searchParams.set("time_from", params.timeFilter.oldest);
-  }
-  if (params.timeFilter.newest) {
-    searchParams.set("time_to", params.timeFilter.newest);
-  }
-  if (params.modelFilter) {
-    searchParams.set("model", params.modelFilter);
-  }
-  if (params.sdkFilter) {
-    searchParams.set("sdk", params.sdkFilter);
-  }
+  if (params.query.trim()) searchParams.set("q", params.query.trim());
+  if (params.timeFilter.oldest) searchParams.set("time_from", params.timeFilter.oldest);
+  if (params.timeFilter.newest) searchParams.set("time_to", params.timeFilter.newest);
+  if (params.modelFilter) searchParams.set("model", params.modelFilter);
+  if (params.sdkFilter) searchParams.set("sdk", params.sdkFilter);
   for (const agentHarnessFilter of params.agentHarnessFilters) {
     searchParams.append("agent_harness", agentHarnessFilter);
   }
@@ -298,220 +237,83 @@ export async function searchRecords(params: {
   for (const categoryFilter of params.categoryFilters) {
     searchParams.append("category", categoryFilter);
   }
-  if (params.costFilter.min != null) {
-    searchParams.set("cost_min", String(params.costFilter.min));
+  if (params.costFilter.min != null) searchParams.set("cost_min", String(params.costFilter.min));
+  if (params.costFilter.max != null) searchParams.set("cost_max", String(params.costFilter.max));
+  for (const rating of params.ratingFilter) {
+    searchParams.append("rating", rating);
   }
-  if (params.costFilter.max != null) {
-    searchParams.set("cost_max", String(params.costFilter.max));
+  for (const rating of params.secondaryRatingFilter) {
+    searchParams.append("secondary_rating", rating);
   }
-  for (const ratingFilter of params.ratingFilter) {
-    searchParams.append("rating", ratingFilter);
-  }
-  for (const secondaryRatingFilter of params.secondaryRatingFilter) {
-    searchParams.append("secondary_rating", secondaryRatingFilter);
-  }
-  if (params.limit) {
-    searchParams.set("limit", String(params.limit));
-  }
-  return fetchJson<RecordSummary[]>(`/api/records/search?${searchParams.toString()}`);
+  return fetchJson<RecordBrowseIdsResponse>(`/api/records/ids?${searchParams.toString()}`);
+}
+
+export async function searchRecords(params: {
+  source: SourceFilter;
+  query: string;
+  limit: number;
+  timeFilter: TimeFilter;
+  modelFilter: string | null;
+  sdkFilter: string | null;
+  agentHarnessFilters: string[];
+  authorFilters: string[];
+  categoryFilters: string[];
+  costFilter: CostFilter;
+  ratingFilter: RatingFilter;
+  secondaryRatingFilter: RatingFilter;
+}): Promise<RecordBrowseResponse> {
+  return browseRecords({
+    ...params,
+    offset: 0,
+  });
+}
+
+export async function rateRecord(recordId: string, rating: number): Promise<RecordRatingResponse> {
+  return fetchJson<RecordRatingResponse>(`/api/records/${encodeURIComponent(recordId)}/rating`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ rating }),
+  });
+}
+
+export async function rateRecordSecondary(recordId: string, rating: number | null): Promise<RecordSecondaryRatingResponse> {
+  return fetchJson<RecordSecondaryRatingResponse>(`/api/records/${encodeURIComponent(recordId)}/secondary-rating`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ rating }),
+  });
+}
+
+export async function hydrateRecord(recordId: string): Promise<HydrateRecordResult> {
+  return fetchJson<HydrateRecordResult>(`/api/records/${encodeURIComponent(recordId)}/hydrate`, { method: "POST" });
 }
 
 export async function deleteRecord(recordId: string): Promise<DeleteRecordResult> {
-  const response = await fetch(`/api/records/${encodeURIComponent(recordId)}`, {
-    method: "DELETE",
-  });
-  if (!response.ok) {
-    throw new HttpError(response.status, await readErrorMessage(response));
-  }
-  return (await response.json()) as DeleteRecordResult;
+  return fetchJson<DeleteRecordResult>(`/api/records/${encodeURIComponent(recordId)}`, { method: "DELETE" });
 }
 
-export async function promoteRecordToDataset(
-  recordId: string,
-  params: {
-    categorySlug: string;
-    categoryTitle?: string | null;
-    datasetId?: string | null;
-  },
-): Promise<DatasetEntry> {
-  const response = await fetch(`/api/records/${encodeURIComponent(recordId)}/promote`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      category_slug: params.categorySlug.trim(),
-      category_title: params.categoryTitle?.trim() ? params.categoryTitle.trim() : null,
-      dataset_id: params.datasetId?.trim() ? params.datasetId.trim() : null,
-    }),
-  });
-  if (!response.ok) {
-    throw new HttpError(response.status, await readErrorMessage(response));
-  }
-  return (await response.json()) as DatasetEntry;
-}
-
-export async function deleteStagingEntry(
-  runId: string,
-  recordId: string,
-): Promise<DeleteStagingResult> {
-  const response = await fetch(
+export async function deleteStaging(runId: string, recordId: string): Promise<DeleteStagingResult> {
+  return fetchJson<DeleteStagingResult>(
     `/api/staging/${encodeURIComponent(runId)}/${encodeURIComponent(recordId)}`,
-    {
-      method: "DELETE",
-    },
+    { method: "DELETE" },
   );
-  if (!response.ok) {
-    throw new Error(await readErrorMessage(response));
-  }
-  return (await response.json()) as DeleteStagingResult;
 }
 
 export async function openRecordFolder(recordId: string): Promise<OpenRecordFolderResult> {
-  const response = await fetch(`/api/records/${encodeURIComponent(recordId)}/open-folder`, {
-    method: "POST",
-  });
-  if (!response.ok) {
-    throw new Error(await readErrorMessage(response));
-  }
-  return (await response.json()) as OpenRecordFolderResult;
-}
-
-export async function fetchRunDetail(runId: string): Promise<RunDetail> {
-  return fetchJson<RunDetail>(`/api/runs/${runId}`);
-}
-
-export async function fetchRecordFile(recordId: string, filePath: string): Promise<string> {
-  const response = await fetch(`/api/records/${encodeURIComponent(recordId)}/files/${filePath}`);
-  if (!response.ok) {
-    throw new HttpError(response.status, await readErrorMessage(response));
-  }
-  return response.text();
-}
-
-export async function fetchRecordTextFile(
-  recordId: string,
-  filePath: string,
-  options?: {
-    full?: boolean;
-    previewBytes?: number;
-  },
-): Promise<RecordTextFileResult> {
-  const searchParams = new URLSearchParams();
-  if (options?.full) {
-    searchParams.set("full", "true");
-  }
-  if (options?.previewBytes != null) {
-    searchParams.set("preview_bytes", String(options.previewBytes));
-  }
-  const query = searchParams.size > 0 ? `?${searchParams.toString()}` : "";
-  return fetchJson<RecordTextFileResult>(
-    `/api/records/${encodeURIComponent(recordId)}/text/${filePath}${query}`,
-  );
-}
-
-export async function fetchRecordTraceFile(recordId: string, filePath: string): Promise<string> {
-  const response = await fetch(`/api/records/${encodeURIComponent(recordId)}/traces/${filePath}`);
-  if (!response.ok) {
-    throw new HttpError(response.status, await readErrorMessage(response));
-  }
-  return response.text();
-}
-
-export function recordRevisionTraceUrl(
-  recordId: string,
-  revisionId: string,
-  filePath = "trajectory.jsonl",
-): string {
-  return `/api/records/${encodeURIComponent(recordId)}/revisions/${encodeURIComponent(
-    revisionId,
-  )}/traces/${filePath}`;
-}
-
-export async function fetchStagingEntries(): Promise<StagingEntry[]> {
-  return fetchJson<StagingEntry[]>("/api/staging");
-}
-
-export async function fetchStagingFile(runId: string, recordId: string, filePath: string): Promise<string> {
-  const response = await fetch(
-    `/api/staging/${encodeURIComponent(runId)}/${encodeURIComponent(recordId)}/files/${filePath}`,
-  );
-  if (!response.ok) {
-    throw new Error(await readErrorMessage(response));
-  }
-  return response.text();
-}
-
-export async function fetchStagingTextFile(
-  runId: string,
-  recordId: string,
-  filePath: string,
-  options?: {
-    full?: boolean;
-    previewBytes?: number;
-  },
-): Promise<RecordTextFileResult> {
-  const searchParams = new URLSearchParams();
-  if (options?.full) {
-    searchParams.set("full", "true");
-  }
-  if (options?.previewBytes != null) {
-    searchParams.set("preview_bytes", String(options.previewBytes));
-  }
-  const query = searchParams.size > 0 ? `?${searchParams.toString()}` : "";
-  return fetchJson<RecordTextFileResult>(
-    `/api/staging/${encodeURIComponent(runId)}/${encodeURIComponent(recordId)}/text/${filePath}${query}`,
-  );
-}
-
-export async function fetchStagingTraceFile(runId: string, recordId: string, filePath: string): Promise<string> {
-  const response = await fetch(
-    `/api/staging/${encodeURIComponent(runId)}/${encodeURIComponent(recordId)}/traces/${filePath}`,
-  );
-  if (!response.ok) {
-    throw new Error(await readErrorMessage(response));
-  }
-  return response.text();
+  return fetchJson<OpenRecordFolderResult>(`/api/records/${encodeURIComponent(recordId)}/open-folder`, { method: "POST" });
 }
 
 export async function openStagingFolder(runId: string, recordId: string): Promise<OpenStagingFolderResult> {
-  const response = await fetch(
+  return fetchJson<OpenStagingFolderResult>(
     `/api/staging/${encodeURIComponent(runId)}/${encodeURIComponent(recordId)}/open-folder`,
     { method: "POST" },
   );
-  if (!response.ok) {
-    throw new Error(await readErrorMessage(response));
-  }
-  return (await response.json()) as OpenStagingFolderResult;
 }
 
-export async function saveRecordRating(recordId: string, rating: number): Promise<RecordRatingResponse> {
-  const response = await fetch(`/api/records/${encodeURIComponent(recordId)}/rating`, {
-    method: "PUT",
-    headers: {
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({ rating }),
-  });
-  if (!response.ok) {
-    throw new Error(await readErrorMessage(response));
-  }
-  return (await response.json()) as RecordRatingResponse;
+export async function fetchRecordHistory(recordId: string): Promise<RecordHistory> {
+  return fetchJson<RecordHistory>(`/api/records/${encodeURIComponent(recordId)}/history`);
 }
 
-export async function saveRecordSecondaryRating(
-  recordId: string,
-  secondaryRating: number | null,
-): Promise<RecordSecondaryRatingResponse> {
-  const response = await fetch(`/api/records/${encodeURIComponent(recordId)}/secondary-rating`, {
-    method: "PUT",
-    headers: {
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({ secondary_rating: secondaryRating }),
-  });
-  if (!response.ok) {
-    throw new Error(await readErrorMessage(response));
-  }
-  return (await response.json()) as RecordSecondaryRatingResponse;
+export async function fetchRunDetail(runId: string): Promise<RunDetail> {
+  return fetchJson<RunDetail>(`/api/runs/${encodeURIComponent(runId)}`);
 }
