@@ -1,4 +1,4 @@
-import { useSyncExternalStore } from "react";
+import { useMemo, useSyncExternalStore } from "react";
 import { parseRoute, type AppRoute } from "@/lib/router";
 
 function subscribe(callback: () => void): () => void {
@@ -14,5 +14,5 @@ function getSnapshot(): PageName {
 
 export function useRoute(): AppRoute {
   const page = useSyncExternalStore(subscribe, getSnapshot);
-  return { page };
+  return useMemo(() => ({ page }), [page]);
 }
