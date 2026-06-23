@@ -55,7 +55,7 @@ const URL_QUERY_PARAMS = {
   run: "run",
 } as const;
 
-const INSPECTOR_TABS = ["inspect", "render", "code", "metadata"] as const satisfies readonly InspectorTab[];
+const INSPECTOR_TABS = ["inspect", "diagnostics", "render", "code", "metadata"] as const satisfies readonly InspectorTab[];
 const BROWSER_TABS = ["workbench", "dataset", "staging"] as const satisfies readonly BrowserTab[];
 const SOURCE_FILTERS = ["workbench", "dataset"] as const satisfies readonly SourceFilter[];
 const TIME_FILTER_POINTS = new Set<string>(["1y", "180d", "90d", "60d", "30d", "14d", "7d", "3d", "24h", "12h", "6h", "1h"]);
@@ -376,14 +376,14 @@ function syncViewerStateToUrl(state: ViewerUrlState): void {
   }
 
   url.searchParams.delete(URL_QUERY_PARAMS.author);
-  if (state.browserTab !== "staging" && state.sourceFilter === "dataset") {
+  if (state.browserTab !== "staging") {
     for (const authorFilter of [...state.authorFilters].sort((left, right) => left.localeCompare(right))) {
       url.searchParams.append(URL_QUERY_PARAMS.author, authorFilter);
     }
   }
 
   url.searchParams.delete(URL_QUERY_PARAMS.category);
-  if (state.browserTab !== "staging" && state.sourceFilter === "dataset") {
+  if (state.browserTab !== "staging") {
     for (const categoryFilter of [...state.categoryFilters].sort((left, right) => left.localeCompare(right))) {
       url.searchParams.append(URL_QUERY_PARAMS.category, categoryFilter);
     }
@@ -394,7 +394,6 @@ function syncViewerStateToUrl(state: ViewerUrlState): void {
   } else {
     url.searchParams.delete(URL_QUERY_PARAMS.costMin);
   }
-
   if (state.browserTab !== "staging" && state.costFilter.max != null) {
     url.searchParams.set(URL_QUERY_PARAMS.costMax, String(state.costFilter.max));
   } else {
@@ -403,19 +402,19 @@ function syncViewerStateToUrl(state: ViewerUrlState): void {
 
   url.searchParams.delete(URL_QUERY_PARAMS.rating);
   if (state.browserTab !== "staging") {
-    for (const ratingFilter of [...state.ratingFilter].sort((left, right) => left.localeCompare(right))) {
-      url.searchParams.append(URL_QUERY_PARAMS.rating, ratingFilter);
+    for (const rating of state.ratingFilter) {
+      url.searchParams.append(URL_QUERY_PARAMS.rating, rating);
     }
   }
 
   url.searchParams.delete(URL_QUERY_PARAMS.secondaryRating);
   if (state.browserTab !== "staging") {
-    for (const secondaryRatingFilter of [...state.secondaryRatingFilter].sort((left, right) => left.localeCompare(right))) {
-      url.searchParams.append(URL_QUERY_PARAMS.secondaryRating, secondaryRatingFilter);
+    for (const rating of state.secondaryRatingFilter) {
+      url.searchParams.append(URL_QUERY_PARAMS.secondaryRating, rating);
     }
   }
 
-  if (state.browserTab !== "staging" && state.selectedRunId) {
+  if (state.selectedRunId) {
     url.searchParams.set(URL_QUERY_PARAMS.run, state.selectedRunId);
   } else {
     url.searchParams.delete(URL_QUERY_PARAMS.run);
@@ -823,12 +822,10 @@ function viewerReducer(state: ViewerState, action: ViewerAction): ViewerState {
         }
       }
       if (anchorIndex === -1) anchorIndex = targetIndex;
-
-      const start = Math.min(anchorIndex, targetIndex);
-      const end = Math.max(anchorIndex, targetIndex);
+      const [start, end] = anchorIndex < targetIndex ? [anchorIndex, targetIndex] : [targetIndex, anchorIndex];
       const next = new Set(state.multiSelection);
-      for (let i = start; i <= end; i++) {
-        next.add(visibleIds[i]);
+      for (const id of visibleIds.slice(start, end + 1)) {
+        next.add(id);
       }
       return { ...state, multiSelection: next };
     }
@@ -841,43 +838,34 @@ function viewerReducer(state: ViewerState, action: ViewerAction): ViewerState {
   }
 }
 
-const ViewerStateContext = createContext<ViewerState>(initialState);
-const ViewerDispatchContext = createContext<Dispatch<ViewerAction>>(() => {});
+const ViewerContext = createContext<{
+  state: ViewerState;
+  dispatch: Dispatch<ViewerAction>;
+} | null>(null);
 
-export function ViewerProvider({ children }: { children: ReactNode }): JSX.Element {
+type ViewerProviderProps = {
+  children: ReactNode;
+};
+
+export function ViewerProvider({ children }: ViewerProviderProps): JSX.Element {
   const [state, dispatch] = useReducer(viewerReducer, initialState);
-  const route = useRoute();
-  const selectedCachedRecord =
-    state.selection?.kind === "record" && state.selectedRecordId
-      ? state.recordCache[state.selectedRecordId] ?? null
-      : null;
   const bootstrapQuery = useQuery(bootstrapQueryOptions());
-  const activeBootstrap = state.bootstrap ?? bootstrapQuery.data ?? null;
-  const shouldPollStaging =
-    route.page === "viewer"
-      && activeBootstrap != null
-      && (
-        state.browserTab === "staging"
-        || activeBootstrap.runs.some((run) => isRunActive(run))
-      );
+  const selectedRecordSummaryQuery = useQuery({
+    ...recordSummaryQueryOptions(state.selectedRecordId),
+    enabled: state.selectedRecordId != null,
+  });
   const stagingEntriesQuery = useQuery({
     ...stagingEntriesQueryOptions(),
-    enabled: shouldPollStaging,
-    refetchInterval: STAGING_POLL_INTERVAL_MS,
-    refetchIntervalInBackground: true,
+    enabled: state.browserTab === "staging" || state.selectedRunId != null,
+    refetchInterval: (query) => {
+      const entries = query.state.data;
+      if (!entries || !entries.some((entry) => isRunActive(entry.status))) {
+        return false;
+      }
+      return STAGING_POLL_INTERVAL_MS;
+    },
   });
-  const selectedRecordId =
-    state.selection?.kind === "record" ? state.selectedRecordId : null;
-  const selectedRecordSummaryQuery = useQuery({
-    ...recordSummaryQueryOptions(selectedRecordId ?? ""),
-    enabled: selectedRecordId != null,
-    retry: (failureCount, error) =>
-      !(error instanceof HttpError && error.status === 404) && failureCount < 2,
-  });
-
-  useEffect(() => {
-    dispatch({ type: "SET_LOADING", payload: bootstrapQuery.isPending });
-  }, [bootstrapQuery.isPending]);
+  const route = useRoute();
 
   useEffect(() => {
     if (bootstrapQuery.data) {
@@ -886,71 +874,10 @@ export function ViewerProvider({ children }: { children: ReactNode }): JSX.Eleme
   }, [bootstrapQuery.data]);
 
   useEffect(() => {
-    if (!bootstrapQuery.error) {
-      return;
-    }
-    dispatch({
-      type: "SET_ERROR",
-      payload:
-        bootstrapQuery.error instanceof Error
-          ? bootstrapQuery.error.message
-          : "Failed to load viewer data.",
-    });
-  }, [bootstrapQuery.error]);
-
-  useEffect(() => {
-    if (state.selection?.kind !== "record" || !state.selectedRecordId) {
-      dispatch({ type: "SET_SELECTED_RECORD_SUMMARY", payload: null });
-      return;
-    }
-
-    if (selectedCachedRecord) {
-      dispatch({ type: "SET_SELECTED_RECORD_SUMMARY", payload: selectedCachedRecord });
-    }
-  }, [dispatch, selectedCachedRecord, state.selectedRecordId, state.selection]);
-
-  useEffect(() => {
-    if (state.selection?.kind !== "record" || !state.selectedRecordId) {
-      return;
-    }
-
-    if (selectedRecordSummaryQuery.data) {
+    if (selectedRecordSummaryQuery.data !== undefined) {
       dispatch({ type: "SET_SELECTED_RECORD_SUMMARY", payload: selectedRecordSummaryQuery.data });
     }
-  }, [
-    dispatch,
-    selectedRecordSummaryQuery.data,
-    state.selectedRecordId,
-    state.selection?.kind,
-  ]);
-
-  useEffect(() => {
-    if (
-      state.selection?.kind !== "record"
-      || !state.selectedRecordId
-      || !selectedRecordSummaryQuery.error
-    ) {
-      return;
-    }
-
-    if (
-      selectedRecordSummaryQuery.error instanceof HttpError
-      && selectedRecordSummaryQuery.error.status === 404
-    ) {
-      dispatch({ type: "DELETE_RECORD_LOCAL", payload: state.selectedRecordId });
-      return;
-    }
-
-    if (!selectedCachedRecord) {
-      dispatch({ type: "SET_SELECTED_RECORD_SUMMARY", payload: null });
-    }
-  }, [
-    dispatch,
-    selectedCachedRecord,
-    selectedRecordSummaryQuery.error,
-    state.selectedRecordId,
-    state.selection?.kind,
-  ]);
+  }, [selectedRecordSummaryQuery.data]);
 
   useEffect(() => {
     if (stagingEntriesQuery.data) {
@@ -959,76 +886,32 @@ export function ViewerProvider({ children }: { children: ReactNode }): JSX.Eleme
   }, [stagingEntriesQuery.data]);
 
   useEffect(() => {
-    if (route.page !== "viewer") {
-      return;
-    }
-
-    syncViewerStateToUrl({
-      selection: state.selection,
-      selectedRecordId: state.selectedRecordId,
-      selectedInspectorTab: state.selectedInspectorTab,
-      searchQuery: state.searchQuery,
-      browserTab: state.browserTab,
-      sourceFilter: state.sourceFilter,
-      timeFilter: state.timeFilter,
-      modelFilter: state.modelFilter,
-      sdkFilter: state.sdkFilter,
-      agentHarnessFilters: state.agentHarnessFilters,
-      authorFilters: state.authorFilters,
-      categoryFilters: state.categoryFilters,
-      costFilter: state.costFilter,
-      ratingFilter: state.ratingFilter,
-      secondaryRatingFilter: state.secondaryRatingFilter,
-      selectedRunId: state.selectedRunId,
-    });
-  }, [
-    state.categoryFilters,
-    state.costFilter,
-    state.modelFilter,
-    state.sdkFilter,
-    state.agentHarnessFilters,
-    state.authorFilters,
-    state.ratingFilter,
-    state.secondaryRatingFilter,
-    state.browserTab,
-    state.searchQuery,
-    state.selectedInspectorTab,
-    state.selectedRecordId,
-    state.selectedRunId,
-    state.selection,
-    state.sourceFilter,
-    state.timeFilter,
-    route.page,
-  ]);
+    dispatch({ type: "SYNC_FROM_URL", payload: readViewerUrlState() });
+  }, [route]);
 
   useEffect(() => {
-    if (typeof window === "undefined") {
-      return;
+    syncViewerStateToUrl(state);
+  }, [state]);
+
+  const error = bootstrapQuery.error || selectedRecordSummaryQuery.error || stagingEntriesQuery.error;
+  useEffect(() => {
+    if (error) {
+      const message = error instanceof HttpError
+        ? `${error.status} ${error.statusText}`
+        : error instanceof Error
+          ? error.message
+          : "Unknown viewer error";
+      dispatch({ type: "SET_ERROR", payload: message });
     }
+  }, [error]);
 
-    const handlePopState = () => {
-      dispatch({ type: "SYNC_FROM_URL", payload: readViewerUrlState() });
-    };
-
-    window.addEventListener("popstate", handlePopState);
-    return () => {
-      window.removeEventListener("popstate", handlePopState);
-    };
-  }, []);
-
-  return (
-    <ViewerStateContext.Provider value={state}>
-      <ViewerDispatchContext.Provider value={dispatch}>
-        {children}
-      </ViewerDispatchContext.Provider>
-    </ViewerStateContext.Provider>
-  );
+  return <ViewerContext.Provider value={{ state, dispatch }}>{children}</ViewerContext.Provider>;
 }
 
-export function useViewer(): ViewerState {
-  return useContext(ViewerStateContext);
-}
-
-export function useViewerDispatch(): Dispatch<ViewerAction> {
-  return useContext(ViewerDispatchContext);
+export function useViewer(): ViewerState & { dispatch: Dispatch<ViewerAction> } {
+  const context = useContext(ViewerContext);
+  if (!context) {
+    throw new Error("useViewer must be used inside ViewerProvider");
+  }
+  return { ...context.state, dispatch: context.dispatch };
 }
