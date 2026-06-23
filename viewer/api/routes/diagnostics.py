@@ -25,6 +25,9 @@ class VisualReassignmentMove(BaseModel):
     visual_name: str | None = None
     origin_xyz: Vec3 | None = None
     origin_rpy: Vec3 | None = None
+    collision_index: int | None = Field(default=None, ge=0)
+    collision_origin_xyz: Vec3 | None = None
+    collision_origin_rpy: Vec3 | None = None
     reason: str | None = None
 
     @field_validator("source_link", "target_link", "visual_name", "reason")
@@ -35,7 +38,7 @@ class VisualReassignmentMove(BaseModel):
         stripped = value.strip()
         return stripped or None
 
-    @field_validator("origin_xyz", "origin_rpy", mode="before")
+    @field_validator("origin_xyz", "origin_rpy", "collision_origin_xyz", "collision_origin_rpy", mode="before")
     @classmethod
     def _validate_vec3(cls, value: object) -> Vec3 | None:
         if value is None:
@@ -105,18 +108,49 @@ def _format_vec3(value: Vec3) -> str:
     return " ".join(f"{item:.12g}" for item in value)
 
 
-def _set_visual_origin(visual: ET.Element, xyz: Vec3 | None, rpy: Vec3 | None) -> None:
+def _set_origin(element: ET.Element, xyz: Vec3 | None, rpy: Vec3 | None) -> None:
     if xyz is None and rpy is None:
         return
-    origins = _direct_children(visual, "origin")
+    origins = _direct_children(element, "origin")
     origin = origins[0] if origins else None
     if origin is None:
         origin = ET.Element("origin")
-        visual.insert(0, origin)
+        element.insert(0, origin)
     if xyz is not None:
         origin.set("xyz", _format_vec3(xyz))
     if rpy is not None:
         origin.set("rpy", _format_vec3(rpy))
+
+
+def _mesh_filename(element: ET.Element) -> str | None:
+    for geometry in _direct_children(element, "geometry"):
+        for child in list(geometry):
+            if child.tag.rsplit("}", 1)[-1] == "mesh":
+                filename = child.get("filename")
+                return filename.strip() if filename else None
+    return None
+
+
+def _matching_collision_index(source: ET.Element, visual: ET.Element, visual_index: int) -> int | None:
+    collisions = _direct_children(source, "collision")
+    if not collisions:
+        return None
+
+    visual_name = visual.get("name")
+    if visual_name:
+        for index, collision in enumerate(collisions):
+            if collision.get("name") == visual_name:
+                return index
+
+    visual_mesh = _mesh_filename(visual)
+    if visual_mesh:
+        for index, collision in enumerate(collisions):
+            if _mesh_filename(collision) == visual_mesh:
+                return index
+
+    if visual_index < len(collisions):
+        return visual_index
+    return None
 
 
 def _apply_visual_reassignments(
@@ -155,9 +189,30 @@ def _apply_visual_reassignments(
                 ),
             )
 
-        _set_visual_origin(visual, move.origin_xyz, move.origin_rpy)
+        collisions = _direct_children(source, "collision")
+        collision_index = move.collision_index
+        if collision_index is None:
+            collision_index = _matching_collision_index(source, visual, move.visual_index)
+        collision: ET.Element | None = None
+        collision_name: str | None = None
+        if collision_index is not None:
+            if collision_index >= len(collisions):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Collision index {collision_index} is out of range for {move.source_link}",
+                )
+            collision = collisions[collision_index]
+            collision_name = collision.get("name")
+
+        _set_origin(visual, move.origin_xyz, move.origin_rpy)
         source.remove(visual)
         target.append(visual)
+
+        if collision is not None and collision in list(source):
+            _set_origin(collision, move.collision_origin_xyz or move.origin_xyz, move.collision_origin_rpy or move.origin_rpy)
+            source.remove(collision)
+            target.append(collision)
+
         applied.append(
             {
                 "source_link": move.source_link,
@@ -166,6 +221,10 @@ def _apply_visual_reassignments(
                 "visual_name": actual_name,
                 "origin_xyz": list(move.origin_xyz) if move.origin_xyz is not None else None,
                 "origin_rpy": list(move.origin_rpy) if move.origin_rpy is not None else None,
+                "collision_index": collision_index,
+                "collision_name": collision_name,
+                "collision_origin_xyz": list(move.collision_origin_xyz) if move.collision_origin_xyz is not None else None,
+                "collision_origin_rpy": list(move.collision_origin_rpy) if move.collision_origin_rpy is not None else None,
                 "reason": move.reason,
             }
         )
@@ -199,7 +258,7 @@ async def apply_visual_reassignments(
     patch_path.write_text(
         json.dumps(
             {
-                "schema_version": 2,
+                "schema_version": 3,
                 "record_id": record_id,
                 "mode": payload.mode,
                 "created_at": datetime.now(timezone.utc).isoformat(),
