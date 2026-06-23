@@ -26,7 +26,7 @@ export const viewerQueryKeys = {
   datasetEntries: () => [...viewerQueryKeys.root(), "dataset-entries"] as const,
   categories: () => [...viewerQueryKeys.root(), "categories"] as const,
   stagingEntries: () => [...viewerQueryKeys.root(), "staging-entries"] as const,
-  recordSummary: (recordId: string) => [...viewerQueryKeys.root(), "record-summary", recordId] as const,
+  recordSummary: (recordId: string | null) => [...viewerQueryKeys.root(), "record-summary", recordId ?? ""] as const,
   browseRecords: (params: BrowseRecordsParams) =>
     [...viewerQueryKeys.root(), "browse-records", params] as const,
   browseRecordIds: (params: BrowseRecordIdsParams) =>
@@ -84,10 +84,15 @@ export function stagingEntriesQueryOptions() {
   });
 }
 
-export function recordSummaryQueryOptions(recordId: string) {
+export function recordSummaryQueryOptions(recordId: string | null) {
   return queryOptions({
     queryKey: viewerQueryKeys.recordSummary(recordId),
-    queryFn: () => fetchRecordSummary(recordId),
+    queryFn: () => {
+      if (recordId == null) {
+        throw new Error("recordSummaryQueryOptions requires a record id");
+      }
+      return fetchRecordSummary(recordId);
+    },
     staleTime: 5_000,
   });
 }
