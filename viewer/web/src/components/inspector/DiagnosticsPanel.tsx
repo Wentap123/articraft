@@ -85,6 +85,7 @@ const CATEGORY_LABELS: Record<Category, string> = {
 };
 
 const OUTLIER_VISUAL_RE = /outlier/i;
+const ORIGINAL_PART_VISUAL_RE = /(?:^|[/\\_-])original[-_]?\d+(?:\.|$)/i;
 const PROXY_FALLBACK_RADIUS = 0.035;
 const PROXY_CONTACT_MARGIN = 0.006;
 
@@ -254,6 +255,10 @@ function itemWorldPosition(linkName: string, item: UrdfVisual, transforms: Map<s
 
 function linkByName(spec: UrdfSpec): Map<string, UrdfLink> {
   return new Map(spec.links.map((link) => [link.name, link]));
+}
+
+function isOriginalPartVisual(text: string): boolean {
+  return ORIGINAL_PART_VISUAL_RE.test(text);
 }
 
 function collisionHitForVisual(
@@ -484,8 +489,10 @@ function visualCandidates(spec: UrdfSpec, jointValues: Map<string, number>, coll
       const targetJoint = collisionHit?.joint ?? namedJoint ?? childJoints[0];
       const movedPose = Math.abs(jointValues.get(targetJoint.name) ?? 0) > 0.001;
       const outlierName = OUTLIER_VISUAL_RE.test(text);
+      const originalPartName = isOriginalPartVisual(text);
 
       if (!outlierName && !collisionHit) continue;
+      if (!outlierName && originalPartName) continue;
 
       const evidence = [
         `Visual ${descriptor.label} is attached to ${link.name}.`,
