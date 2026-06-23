@@ -44,7 +44,10 @@ export function formatTokenCount(tokens: number | null): string {
   return `${Math.round(value / 100_000_000) / 10}b`;
 }
 
-export function isRunActive(run: RunSummary): boolean {
+export function isRunActive(run: RunSummary | string | null): boolean {
+  if (typeof run === "string" || run == null) {
+    return run === "running" || run === "in_progress";
+  }
   if (run.status === "running" || run.status === "in_progress") return true;
   if (run.prompt_count != null && run.result_count < run.prompt_count) return true;
   return false;
